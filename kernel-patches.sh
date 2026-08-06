@@ -1,38 +1,38 @@
 # kernel-patches.sh
-# Sourcowany przez install_tbsdtv-smart.sh
-# Tu dopisuj nowe patche gdy kompilacja na nowym kernelu sie posypie.
+# Sourced by install_tbsdtv-smart.sh
+# Add new patches here when compilation fails on a new kernel version.
 #
-# Dostepne funkcje (zdefiniowane w glownym skrypcie):
-#   apply_sed_if_match FILE OPIS MARKER 'SED_WYRAZENIE'
-#   apply_python_patch FILE OPIS MARKER 'KOD_PYTHON'
-#   ker_ge  MAJOR MINOR   -> true jezeli biezacy kernel >= MAJOR.MINOR
+# Available functions (defined in main script):
+#   apply_sed_if_match FILE DESC MARKER 'SED_EXPRESSION'
+#   apply_python_patch FILE DESC MARKER 'PYTHON_CODE'
+#   ker_ge  MAJOR MINOR   -> true if current kernel >= MAJOR.MINOR
 #
-# Marker = unikalny fragment STAREGO kodu - jezeli nie istnieje, patch jest pomijany (idempotentne)
-# SRC, DRY_RUN, pi, warn - dostepne z glownego skryptu
+# MARKER = unique fragment of OLD code - patch is skipped if marker not found (idempotent)
+# SRC, DRY_RUN, pi, warn - available from main script
 #
-# ZASADA WERSJONOWANIA PATCHY:
-#   Skrypt wymaga kernela 7.0+. Wszystkie znane patche sa bezwarunkowe
-#   (stosowane zawsze), bo repo TBS nie synchronizuje kodu z mainline.
-#   Idempotentnosc (marker) gwarantuje, ze patch nie uszkodzi kodu,
-#   jesli TBS kiedys naprawi swoje zrodla.
+# VERSIONING POLICY:
+#   Script requires kernel 7.0+. All known patches are unconditional
+#   (always applied), because the TBS repo does not track mainline kernel API changes.
+#   Idempotency (marker check) ensures patches won't corrupt code if TBS
+#   ever fixes their sources upstream.
 #
-#   Gdy pojawi sie nowy blad specyficzny dla konkretnej wersji (np. 7.3+),
-#   uzyj bloku: if ker_ge 7 3; then ... fi
+#   When a new error appears specific to a particular version (e.g. 7.3+),
+#   wrap it in: if ker_ge 7 3; then ... fi
 
 apply_kernel_api_patches() {
-    step "Aplikowanie patchy API kernela (${KVER})"
+    step "Applying kernel API patches (${KVER})"
 
     # -----------------------------------------------------------------------
     # dvb-core/dmxdev.c
     #
-    # Repo TBS nie synchronizuje dmxdev.c z mainline. Wszystkie ponizsze
-    # patche dotycza zmian API ktore weszly w kernelu 6.19 i obowiazuja
-    # rowniez na 7.x. Stosujemy bezwarunkowo.
+    # TBS repo does not sync dmxdev.c with mainline. All patches below address
+    # API changes introduced in kernel 6.19+ and still required on 7.x.
+    # Applied unconditionally (marker check handles idempotency).
     # -----------------------------------------------------------------------
-    pi "dmxdev.c: patche API..."
+    pi "dmxdev.c: API patches..."
 
     # from_timer() -> timer_container_of()
-    # Kernel 6.19: from_timer() usunieto, zastapiono timer_container_of().
+    # Kernel 6.19: from_timer() removed, replaced by timer_container_of().
     apply_sed_if_match \
         "$SRC/drivers/media/dvb-core/dmxdev.c" \
         "dmxdev: from_timer -> timer_container_of" \
@@ -40,15 +40,15 @@ apply_kernel_api_patches() {
         's/from_timer(\(dmxdevfilter\), t, timer)/timer_container_of(dmxdevfilter, t, timer)/g'
 
     # del_timer() -> timer_delete()
-    # Kernel 6.19: del_timer() zastapiono przez timer_delete().
+    # Kernel 6.19: del_timer() replaced by timer_delete().
     apply_sed_if_match \
         "$SRC/drivers/media/dvb-core/dmxdev.c" \
         "dmxdev: del_timer -> timer_delete" \
         "del_timer(" \
         's/del_timer(/timer_delete(/g'
 
-    # dvb_vb2_fill_buffer: 4 argumenty -> 5 (dodano flush=NULL)
-    # Kernel 6.19: makro dvb_vb2_fill_buffer rozszerzone o argument flush.
+    # dvb_vb2_fill_buffer: 4 args -> 5 (added flush=NULL)
+    # Kernel 6.19: dvb_vb2_fill_buffer macro extended with flush argument.
     apply_python_patch \
         "$SRC/drivers/media/dvb-core/dmxdev.c" \
         "dmxdev: dvb_vb2_fill_buffer +flush=NULL" \
@@ -60,16 +60,16 @@ def add_null(m):
     s = m.group(0); return s[:s.rfind(")")] + ", NULL)"
 new = pat.sub(add_null, txt)
 if new != txt:
-    open(f,"w").write(new); print("  OK: dodano flush=NULL")
+    open(f,"w").write(new); print("  OK: added flush=NULL")
 else:
-    print("  Brak wywolan do poprawki")'
+    print("  No calls to patch")'
 
-    # dvb_vb2_init: 3 argumenty -> 4 (dodano mutex)
-    # Kernel 7.0: dvb_vb2_init() rozszerzone o struct mutex *mutex jako 3. argument.
-    #   Stara sygnatura: dvb_vb2_init(ctx, name, non_blocking)
-    #   Nowa sygnatura:  dvb_vb2_init(ctx, name, mutex, non_blocking)
-    # Wywolanie 1: dvb_dvr_open   -> &dmxdev->dvr_vb2_ctx,  mutex = &dmxdev->mutex
-    # Wywolanie 2: dvb_demux_open -> &dmxdevfilter->vb2_ctx, mutex = &dmxdev->mutex
+    # dvb_vb2_init: 3 args -> 4 (added mutex)
+    # Kernel 7.0: dvb_vb2_init() extended with struct mutex *mutex as 3rd argument.
+    #   Old signature: dvb_vb2_init(ctx, name, non_blocking)
+    #   New signature: dvb_vb2_init(ctx, name, mutex, non_blocking)
+    # Call 1: dvb_dvr_open    -> &dmxdev->dvr_vb2_ctx,  mutex = &dmxdev->mutex
+    # Call 2: dvb_demux_open  -> &dmxdevfilter->vb2_ctx, mutex = &dmxdev->mutex
     apply_python_patch \
         "$SRC/drivers/media/dvb-core/dmxdev.c" \
         "dmxdev: dvb_vb2_init +mutex (dvr_vb2_ctx)" \
@@ -81,9 +81,9 @@ pat = re.compile(
     re.DOTALL)
 new = pat.sub(r"\1\n\t\t\t\t\t     &dmxdev->mutex, \2", txt)
 if new != txt:
-    open(f,"w").write(new); print("  OK: dodano &dmxdev->mutex (dvr)")
+    open(f,"w").write(new); print("  OK: added &dmxdev->mutex (dvr)")
 else:
-    print("  Brak zmian (juz naprawione?)")'
+    print("  No changes needed (already patched?)")'
 
     apply_python_patch \
         "$SRC/drivers/media/dvb-core/dmxdev.c" \
@@ -96,32 +96,20 @@ pat = re.compile(
     re.DOTALL)
 new = pat.sub(r"\1\n\t\t     &dmxdev->mutex, \2", txt)
 if new != txt:
-    open(f,"w").write(new); print("  OK: dodano &dmxdev->mutex (demux_filter)")
+    open(f,"w").write(new); print("  OK: added &dmxdev->mutex (demux_filter)")
 else:
-    print("  Brak zmian (juz naprawione?)")'
-
-    # -----------------------------------------------------------------------
-    # dvb-core/dvb-pll.c
-    #
-    # ida_simple_get/remove -> ida_alloc_max/ida_free
-    # Kernel 6.19: stare helpery IDA usuniete z API kernela.
-    # -----------------------------------------------------------------------
-    apply_sed_if_match \
-        "$SRC/drivers/media/dvb-core/dvb-pll.c" \
-        "dvb-pll: ida_simple_get/remove -> ida_alloc_max/ida_free" \
-        "ida_simple_get" \
-        's/ida_simple_get(\([^,]*\), 0, 0,/ida_alloc_max(\1, INT_MAX,/g; s/ida_simple_remove/ida_free/g'
+    print("  No changes needed (already patched?)")'
 
     # -----------------------------------------------------------------------
     # dvb-frontends/avl6882.h
     #
-    # Blok IS_REACHABLE(CONFIG_DVB_AVL6882) -> bezwarunkowy extern.
-    # Przy kompilacji out-of-tree IS_REACHABLE rozwija sie do 0, co chowa
-    # prototyp attach i powoduje blad linkera.
+    # IS_REACHABLE(CONFIG_DVB_AVL6882) block -> unconditional extern.
+    # When compiling out-of-tree, IS_REACHABLE expands to 0, hiding the
+    # attach prototype and causing a linker error.
     # -----------------------------------------------------------------------
     apply_python_patch \
         "$SRC/drivers/media/dvb-frontends/avl6882.h" \
-        "avl6882.h: IS_REACHABLE -> bezwarunkowy extern" \
+        "avl6882.h: IS_REACHABLE -> unconditional extern" \
         "IS_REACHABLE(CONFIG_DVB_AVL6882)" \
         'import sys, re
 f = sys.argv[1]; txt = open(f).read()
@@ -131,16 +119,16 @@ pat = re.compile(
     r".*?#endif[^\n]*CONFIG_DVB_AVL6882[^\n]*", re.DOTALL)
 new = pat.sub(r"\1", txt)
 if new != txt:
-    open(f,"w").write(new); print("  OK: zastapiono blok IS_REACHABLE")
+    open(f,"w").write(new); print("  OK: replaced IS_REACHABLE block")
 else:
-    print("  Brak bloku IS_REACHABLE (juz naprawione?)")'
+    print("  IS_REACHABLE block not found (already patched?)")'
 
     # -----------------------------------------------------------------------
     # dvb-frontends/cxd2820r_core.c
     #
-    # gpio_chip.set: zmiana sygnatury void -> int
-    # Kernel 6.19: callback .set w struct gpio_chip zmienil typ zwracany
-    # z void na int. TBS ma stara deklaracje void, co powoduje blad przypisania.
+    # gpio_chip.set: signature change void -> int
+    # Kernel 6.19: .set callback in struct gpio_chip changed return type
+    # from void to int. TBS has old void declaration causing type mismatch.
     # -----------------------------------------------------------------------
     apply_python_patch \
         "$SRC/drivers/media/dvb-frontends/cxd2820r_core.c" \
@@ -155,9 +143,9 @@ new = txt.replace(
 if new != txt:
     open(f,"w").write(new); print("  OK: gpio_set void -> int")
 else:
-    print("  Brak zmian do aplikacji")'
+    print("  No changes needed")'
 
-    # Po zmianie void -> int funkcja musi zwracac 0 zamiast pustego return.
+    # After void -> int change, function must return 0 instead of bare return.
     apply_sed_if_match \
         "$SRC/drivers/media/dvb-frontends/cxd2820r_core.c" \
         "cxd2820r: gpio_set return; -> return 0;" \
@@ -167,10 +155,10 @@ else:
     # -----------------------------------------------------------------------
     # dvb-frontends/mxl58x.c
     #
-    # Funkcje zdefiniowane ale nieuzywane -> __maybe_unused.
-    # Blad w kodzie TBS (nie zmiana API kernela) - dotyczy wszystkich kerneli.
+    # Unused static functions -> __maybe_unused.
+    # TBS code bug (not a kernel API change) - affects all kernels.
     # -----------------------------------------------------------------------
-    pi "mxl58x: __maybe_unused dla nieuzywanych funkcji statycznych..."
+    pi "mxl58x: __maybe_unused for unused static functions..."
 
     apply_sed_if_match \
         "$SRC/drivers/media/dvb-frontends/mxl58x.c" \
@@ -191,12 +179,12 @@ else:
         's/static int CfgDemodAbortTune(/static int __maybe_unused CfgDemodAbortTune(/g'
 
     # -----------------------------------------------------------------------
-    # Dopisuj nowe patche powyzej tej linii.
-    # Jesli patch dotyczy konkretnej wersji (np. blad pojawil sie dopiero w 7.3):
+    # Add new patches above this line.
+    # If a patch is specific to a kernel version (e.g. error first appeared in 7.3):
     #   if ker_ge 7 3; then
     #       apply_sed_if_match ...
     #   fi
     # -----------------------------------------------------------------------
 
-    [[ "$DRY_RUN" -eq 1 ]] && info "Dry-run: koniec." || info "Patche zastosowane."
+    [[ "$DRY_RUN" -eq 1 ]] && info "Dry-run: done." || info "All patches applied."
 }
