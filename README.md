@@ -6,7 +6,7 @@ on recent Linux kernels. Compiles drivers directly from the official
 with all patches required to build cleanly on kernel 7.x.
 
 > **Tested on:** Debian Testing (Trixie), kernel **7.0.7+deb14-amd64**  
-> **Last verified:** May 2026
+> **Last verified:** August 2026
 
 ---
 
