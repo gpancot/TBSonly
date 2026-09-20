@@ -26,12 +26,17 @@ KMAJ=$(echo "$KVER" | cut -d. -f1)
 KMIN=$(echo "$KVER" | cut -d. -f2)
 KBUILD="/lib/modules/${KVER}/build"
 KHEADERS_COMMON=$(find /usr/src -maxdepth 1 -name "linux-headers-*-common" | sort -V | tail -1)
+# Ubuntu variant: linux-headers-x.y.z-a (no -generic suffix)
+if [[ -z "$KHEADERS_COMMON" || ! -d "$KHEADERS_COMMON" ]]; then
+    KVER_BASE="${KVER%%-*}"
+    KHEADERS_COMMON=$(find /usr/src -maxdepth 1 -name "linux-headers-${KVER_BASE}" -type d | sort -V | tail -1)
+fi
 BUILD_DIR="$SCRIPT_DIR/tbs-build-tmp"
 INSTALL_DIR="/lib/modules/${KVER}/updates/tbs"
 LOG="$SCRIPT_DIR/install_tbsdtv-smart.log"
 
 # tuners must be compiled before frontends/saa/tbs so Module.symvers is available
-TARGET_DIRS=("dvb-core" "dvb-frontends" "tuners" "pci/saa716x" "pci/tbsecp3" "pci/tbsci" "pci/tbsmod")
+TARGET_DIRS=("dvb-core" "dvb-frontends" "tuners" "pci/saa716x" "pci/tbsecp3" "pci/tbsci" "pci/tbsmod" "usb/dvb-usb")
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC}  $*" | tee -a "$LOG"; }
@@ -86,6 +91,7 @@ cleanup() {
     local mf_saa="$SRC/drivers/media/pci/saa716x/Makefile"
     local mf_tbs="$SRC/drivers/media/pci/tbsecp3/Makefile"
     local mf_tuners="$SRC/drivers/media/tuners/Makefile"
+    local mf_usb="$SRC/drivers/media/usb/dvb-usb/Makefile"
     # Kernel headers: always restore (outside TBS tree)
     [[ -f "${h1}.orig" ]]        && mv "${h1}.orig"        "$h1"        && info "  Restored: dvb_frontend.h"
     [[ -f "${h2}.orig" ]]        && mv "${h2}.orig"        "$h2"        && info "  Restored: frontend.h"
@@ -95,8 +101,211 @@ cleanup() {
     [[ -f "${mf_saa}.orig" ]]    && rm "${mf_saa}.orig"    && info "  Removed backup: saa716x/Makefile.orig"
     [[ -f "${mf_tbs}.orig" ]]    && rm "${mf_tbs}.orig"    && info "  Removed backup: tbsecp3/Makefile.orig"
     [[ -f "${mf_tuners}.orig" ]] && rm "${mf_tuners}.orig" && info "  Removed backup: tuners/Makefile.orig"
+    [[ -f "${mf_usb}.orig" ]]    && rm "${mf_usb}.orig"    && info "  Removed backup: usb/dvb-usb/Makefile.orig"
 }
 trap cleanup EXIT
+
+
+# ===========================================================================
+# TBS Hardware Detection (cosmetic only, does not affect build targets)
+# ===========================================================================
+detect_tbs_cards() {
+    local py_script py_out
+    py_script=$(mktemp /tmp/detect_tbs.XXXXXX.py)
+
+    cat > "$py_script" << 'PYEOF'
+import re, os, glob, subprocess, sys
+
+src = sys.argv[1] if len(sys.argv) > 1 else "/usr/src/tbs-drivers"
+
+def _open(p):
+    return open(p, encoding="utf-8", errors="replace")
+
+def parse_tbs_pci_map(src_path):
+    tbs_map = {}
+
+    # --- TBSECP3 ---
+    cards = os.path.join(src_path, "drivers/media/pci/tbsecp3/tbsecp3-cards.c")
+    core  = os.path.join(src_path, "drivers/media/pci/tbsecp3/tbsecp3-core.c")
+
+    board_names = {}
+    if os.path.exists(cards):
+        with _open(cards) as f:
+            content = f.read()
+        for m in re.finditer(r'\[([A-Z_0-9]+)\]\s*=\s*\{[^}]*?\.name\s*=\s*"([^"]+)"', content, re.DOTALL):
+            board_names[m.group(1)] = m.group(2).strip()
+
+    if os.path.exists(core):
+        with _open(core) as f:
+            content = f.read()
+        for m in re.finditer(r'TBSECP3_ID\(([A-Z_0-9]+),0x([0-9a-fA-F]+),0x([0-9a-fA-F]+)\)', content):
+            bid, sv, sd = m.groups()
+            name = board_names.get(bid, bid)
+            key = (0x544d, 0x6178, int(sv, 16), int(sd, 16))
+            tbs_map[key] = name
+
+    # --- SAA716x ---
+    budget = os.path.join(src_path, "drivers/media/pci/saa716x/saa716x_budget.c")
+    if not os.path.exists(budget):
+        return tbs_map
+
+    defs = {}
+    for h in glob.glob(os.path.join(src_path, "drivers/media/pci/saa716x/*.h")):
+        with _open(h) as f:
+            for m in re.finditer(r'#define\s+([A-Z_][A-Z0-9_]*)\s+0x([0-9a-fA-F]+)', f.read()):
+                defs[m.group(1)] = int(m.group(2), 16)
+
+    defs.setdefault('NXP_SEMICONDUCTOR', 0x1131)
+    defs.setdefault('SAA7160', 0x7160)
+    defs.setdefault('SAA7161', 0x7161)
+    defs.setdefault('SAA7162', 0x7162)
+
+    with _open(budget) as f:
+        budget_lines = f.readlines()
+
+    for line in budget_lines:
+        m = re.search(
+            r'MAKE_ENTRY\(\s*([A-Z_0-9]+)\s*,\s*([A-Z_0-9]+)\s*,\s*([A-Z_0-9]+)\s*,\s*&([a-z_0-9]+)',
+            line)
+        if not m:
+            continue
+
+        sv_n, sd_n, chip_n, cfg_name = m.groups()
+        sv = defs.get(sv_n)
+        sd = defs.get(sd_n)
+        chip = defs.get(chip_n)
+        if sv is None or sd is None or chip is None:
+            continue
+
+        cm = re.search(r'/\*\s*(.+?)\s*\*/', line)
+        model = cm.group(1).strip() if cm else f"{sv_n} {sd_n}"
+
+        tbs_m = re.search(r'tbs(\d+)', cfg_name, re.IGNORECASE)
+        if tbs_m:
+            clone = f"TBS{tbs_m.group(1)}"
+            if clone not in model:
+                model += f" ({clone})"
+
+        key = (0x1131, chip, sv, sd)
+        tbs_map[key] = model
+
+    return tbs_map
+
+def scan_pci():
+    try:
+        out = subprocess.check_output(["lspci", "-vmm", "-nn"], text=True)
+    except Exception:
+        return []
+
+    cards = []
+    current = {}
+    for line in out.splitlines():
+        if line.startswith("Slot:"):
+            if current:
+                cards.append(current)
+            current = {"slot": line[5:].strip()}
+        elif line.startswith("Vendor:"):
+            m = re.search(r'\[([0-9a-fA-F]{4})\]', line)
+            if m: current["vendor"] = int(m.group(1), 16)
+        elif line.startswith("Device:"):
+            m = re.search(r'\[([0-9a-fA-F]{4})\]', line)
+            if m: current["device"] = int(m.group(1), 16)
+        elif line.startswith("SVendor:"):
+            m = re.search(r'\[([0-9a-fA-F]{4})\]', line)
+            if m: current["svendor"] = int(m.group(1), 16)
+        elif line.startswith("SDevice:"):
+            m = re.search(r'\[([0-9a-fA-F]{4})\]', line)
+            if m: current["sdevice"] = int(m.group(1), 16)
+        elif line.startswith("Rev:"):
+            current["rev"] = line[4:].strip()
+
+    if current:
+        cards.append(current)
+    return cards
+
+def main():
+    try:
+        _main_impl()
+    except Exception as e:
+        print("WARN|Detection error: " + repr(e))
+
+def _main_impl():
+    if not os.path.isdir(src):
+        print("WARN|TBS sources not found. Skipping detection.")
+        sys.exit(0)
+
+    tbs_map = parse_tbs_pci_map(src)
+    found = []
+
+    for card in scan_pci():
+        v = card.get("vendor")
+        d = card.get("device")
+        sv = card.get("svendor")
+        sd = card.get("sdevice")
+        if v is None or d is None or sv is None or sd is None:
+            continue
+
+        key = (v, d, sv, sd)
+        if key in tbs_map:
+            if v == 0x544d:
+                family = "TBSECP3"
+            elif v == 0x1131:
+                family = "SAA716x"
+            else:
+                print("WARN|Unknown TBS bridge vendor %04x: %s  [PCI %s]" % (v, tbs_map[key], card.get('slot', '?')))
+                print("WARN|  No driver module assigned - please update the script.")
+                continue
+            found.append({
+                "family": family,
+                "name": tbs_map[key],
+                "slot": card.get("slot", "?"),
+                "sub": "%04x:%04x" % (sv, sd),
+                "rev": card.get("rev", "-")
+            })
+
+    if not found:
+        print("WARN|No TBS cards detected via lspci.")
+        return
+
+    print("INFO|============================================")
+    print("INFO|  DETECTED TBS TUNERS: %d" % len(found))
+    print("INFO|============================================")
+
+    for c in found:
+        print("INFO|Found %s  [PCI %s, subdev %s, rev %s]" % (c['name'], c['slot'], c['sub'], c['rev']))
+        print("INFO|  *** TUNER: %s ***" % c['family'])
+
+    print("INFO|Total TBS cards detected: %d" % len(found))
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+    step "Detecting TBS cards from source tree..."
+
+    if ! command -v lspci >/dev/null 2>&1; then
+        warn "  lspci not found (package: pciutils). Skipping hardware detection."
+        rm -f "$py_script"
+        return
+    fi
+
+    if [[ ! -d "$SRC/drivers/media/pci/tbsecp3" && ! -d "$SRC/drivers/media/pci/saa716x" ]]; then
+        warn "  TBS sources not found yet. Skipping hardware detection."
+        rm -f "$py_script"
+        return
+    fi
+
+    py_out=$(python3 "$py_script" "$SRC" 2>>"$LOG" || true)
+
+    while IFS='|' read -r prefix msg; do
+        case "$prefix" in
+            INFO) info "  $msg" ;;
+            WARN) warn "  $msg" ;;
+        esac
+    done <<< "$py_out"
+
+    rm -f "$py_script"
+}
 
 step "Checking kernel version (required: 7.0+)"
 ker_ge 7 0 || error "Kernel $KVER is too old. Required: 7.0+"
@@ -132,6 +341,7 @@ if [[ "$STALE" -eq 1 ]]; then
     cleanup; trap cleanup EXIT
 fi
 info "Environment OK."
+
 pause
 
 step "Fetching/updating TBS sources -> $SRC"
@@ -154,6 +364,10 @@ pause
 # NOTE: apply_kernel_api_patches must run before BUILD_DIR and before overwriting TBS Makefiles
 apply_kernel_api_patches
 [[ "$DRY_RUN" -eq 1 ]] && { info "Dry-run complete."; exit 0; }
+pause
+
+detect_tbs_cards
+
 pause
 
 step "Creating isolated build directory"
@@ -270,6 +484,55 @@ obj-m += saa716x_tbs-dvb.o
 MAKEFILE
 info "saa716x Makefile ready."
 
+step "Creating minimal Makefile for usb/dvb-usb"
+cp "$SRC/drivers/media/usb/dvb-usb/Makefile" "${SRC}/drivers/media/usb/dvb-usb/Makefile.orig" 2>/dev/null || true
+cat > "$SRC/drivers/media/usb/dvb-usb/Makefile" << 'MAKEFILE'
+ccflags-y += -Idrivers/media/dvb-core
+ccflags-y += -Idrivers/media/dvb-frontends
+ccflags-y += -Idrivers/media/tuners
+dvb-usb-tbs5220-objs := tbs5220.o
+dvb-usb-tbs5230-objs := tbs5230.o
+dvb-usb-tbs5520-objs := tbs5520.o
+dvb-usb-tbs5520se-objs := tbs5520se.o
+dvb-usb-tbs5530-objs := tbs5530.o
+dvb-usb-tbs5580-objs := tbs5580.o
+dvb-usb-tbs5590-objs := tbs5590.o
+dvb-usb-tbs5880-objs := tbs5880.o
+dvb-usb-tbs5881-objs := tbs5881.o
+dvb-usb-tbs5922se-objs := tbs5922se.o
+dvb-usb-tbs5925-objs := tbs5925.o
+dvb-usb-tbs5927-objs := tbs5927.o
+dvb-usb-tbs5930-objs := tbs5930.o
+dvb-usb-tbs5931-objs := tbs5931.o
+dvb-usb-tbs5301-objs := tbs5301.o
+dvb-usb-tbsqbox-objs := tbs-qbox.o
+dvb-usb-tbsqbox2-objs := tbs-qbox2.o
+dvb-usb-tbsqbox2ci-objs := tbs-qbox2ci.o
+dvb-usb-tbsqbox22-objs := tbs-qbox22.o
+dvb-usb-tbsqboxs2-objs := tbs-qboxs2.o
+obj-m += dvb-usb-tbs5220.o
+obj-m += dvb-usb-tbs5230.o
+obj-m += dvb-usb-tbs5520.o
+obj-m += dvb-usb-tbs5520se.o
+obj-m += dvb-usb-tbs5530.o
+obj-m += dvb-usb-tbs5580.o
+obj-m += dvb-usb-tbs5590.o
+obj-m += dvb-usb-tbs5880.o
+obj-m += dvb-usb-tbs5881.o
+obj-m += dvb-usb-tbs5922se.o
+obj-m += dvb-usb-tbs5925.o
+obj-m += dvb-usb-tbs5927.o
+obj-m += dvb-usb-tbs5930.o
+obj-m += dvb-usb-tbs5931.o
+obj-m += dvb-usb-tbs5301.o
+obj-m += dvb-usb-tbsqbox.o
+obj-m += dvb-usb-tbsqbox2.o
+obj-m += dvb-usb-tbsqbox2ci.o
+obj-m += dvb-usb-tbsqbox22.o
+obj-m += dvb-usb-tbsqboxs2.o
+MAKEFILE
+info "usb/dvb-usb Makefile ready."
+
 step "Creating minimal Makefile for pci/tbsecp3"
 cp "$MF_TBS" "${MF_TBS}.orig"
 cat > "$MF_TBS" << 'MAKEFILE'
@@ -380,6 +643,18 @@ info "Log: $LOG"
 pause
 
 step "Module installation"
+# Ubuntu user report: stale modules in updates/ cause version mismatch errors
+UPDATES_DIR="/lib/modules/${KVER}/updates"
+if [[ -d "$UPDATES_DIR" && -n "$(ls -A "$UPDATES_DIR" 2>/dev/null)" ]]; then
+    warn "  Existing modules found in: $UPDATES_DIR"
+    warn "  Old modules may cause version mismatch errors (Ubuntu report)."
+    read -rp "  Remove existing modules before install? [y/N]: " ANS
+    if [[ "${ANS,,}" == "y" ]]; then
+        rm -rf "${UPDATES_DIR:?}"/*
+        info "  Cleared: $UPDATES_DIR"
+    fi
+fi
+
 echo -e "${CYAN}  Install modules for kernel ${KVER}?"
 echo -e "  Target: ${INSTALL_DIR}${NC}"
 read -rp "  [Y/n]: " ANSWER

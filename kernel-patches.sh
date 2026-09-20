@@ -98,7 +98,7 @@ new = pat.sub(r"\1\n\t\t     &dmxdev->mutex, \2", txt)
 if new != txt:
     open(f,"w").write(new); print("  OK: added &dmxdev->mutex (demux_filter)")
 else:
-    print("  No changes needed (already patched?)")'
+    print("  No changes needed (already patched?)"'
 
     # -----------------------------------------------------------------------
     # dvb-frontends/avl6882.h
@@ -121,7 +121,7 @@ new = pat.sub(r"\1", txt)
 if new != txt:
     open(f,"w").write(new); print("  OK: replaced IS_REACHABLE block")
 else:
-    print("  IS_REACHABLE block not found (already patched?)")'
+    print("  IS_REACHABLE block not found (already patched?)"'
 
     # -----------------------------------------------------------------------
     # dvb-frontends/cxd2820r_core.c
